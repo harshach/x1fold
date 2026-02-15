@@ -1,0 +1,9 @@
+{
+    "custom/laptop-mode": {
+        "format": "{}",
+        "exec": "x1fold-laptop-mode status",
+        "on-click": "x1fold-laptop-mode toggle",
+        "return-type": "json",
+        "interval": 5
+    }
+}

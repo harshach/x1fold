@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+
+# One-time setup for ThinkPad X1 Fold 16 on Omarchy (Arch + Hyprland).
+# Run this after installing Omarchy and cloning the x1fold repo.
+#
+# Usage: x1fold-setup [--uninstall]
+#        x1fold-setup --boot-bluetooth    # Set up Bluetooth keyboard for LUKS unlock
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+HYPR_DIR="$HOME/.config/hypr"
+WAYBAR_DIR="$HOME/.config/waybar"
+BIN_DIR="$HOME/.local/bin"
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}[x1fold]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[x1fold]${NC} $*"; }
+error() { echo -e "${RED}[x1fold]${NC} $*" >&2; }
+
+install_packages() {
+    info "Installing required packages..."
+
+    # Official repo packages
+    local packages=(iio-sensor-proxy wvkbd)
+    local to_install=()
+
+    for pkg in "${packages[@]}"; do
+        if ! pacman -Qi "$pkg" &>/dev/null; then
+            to_install+=("$pkg")
+        fi
+    done
+
+    if [[ ${#to_install[@]} -gt 0 ]]; then
+        sudo pacman -S --needed --noconfirm "${to_install[@]}"
+    else
+        info "All official packages already installed."
+    fi
+}
+
+link_scripts() {
+    info "Linking scripts to $BIN_DIR..."
+    mkdir -p "$BIN_DIR"
+
+    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk; do
+        local src="$REPO_DIR/bin/$script"
+        local dst="$BIN_DIR/$script"
+
+        if [[ -e "$dst" && ! -L "$dst" ]]; then
+            warn "$dst exists and is not a symlink, skipping."
+            continue
+        fi
+
+        chmod +x "$src"
+        ln -sf "$src" "$dst"
+        info "  Linked $script"
+    done
+}
+
+link_configs() {
+    info "Linking Hyprland configs..."
+    mkdir -p "$HYPR_DIR"
+
+    for conf in x1fold.conf x1fold-autostart.conf; do
+        local src="$REPO_DIR/config/hypr/$conf"
+        local dst="$HYPR_DIR/$conf"
+
+        if [[ -e "$dst" && ! -L "$dst" ]]; then
+            warn "$dst exists and is not a symlink, skipping."
+            continue
+        fi
+
+        ln -sf "$src" "$dst"
+        info "  Linked $conf"
+    done
+
+    # Add source line to hyprland.conf if not already present
+    local hypr_conf="$HYPR_DIR/hyprland.conf"
+    if [[ -f "$hypr_conf" ]]; then
+        if ! grep -q "x1fold.conf" "$hypr_conf"; then
+            echo "" >> "$hypr_conf"
+            echo "# ThinkPad X1 Fold support" >> "$hypr_conf"
+            echo "source = ~/.config/hypr/x1fold.conf" >> "$hypr_conf"
+            info "  Added source line to hyprland.conf"
+        else
+            info "  hyprland.conf already sources x1fold.conf"
+        fi
+    else
+        warn "hyprland.conf not found at $hypr_conf — you'll need to add this manually:"
+        warn "  source = ~/.config/hypr/x1fold.conf"
+    fi
+}
+
+link_waybar() {
+    info "Linking Waybar config..."
+    mkdir -p "$WAYBAR_DIR"
+
+    local src="$REPO_DIR/config/waybar/x1fold-modules.json"
+    local dst="$WAYBAR_DIR/x1fold-modules.json"
+
+    if [[ -e "$dst" && ! -L "$dst" ]]; then
+        warn "$dst exists and is not a symlink, skipping."
+        return
+    fi
+
+    ln -sf "$src" "$dst"
+    info "  Linked x1fold-modules.json"
+
+    warn "You'll need to manually add the laptop-mode module to your waybar config."
+    warn "Add \"custom/laptop-mode\" to your modules list and include the module config."
+    warn "See: $src"
+}
+
+enable_services() {
+    info "Enabling services..."
+
+    if ! systemctl is-enabled iio-sensor-proxy.service &>/dev/null; then
+        sudo systemctl enable --now iio-sensor-proxy.service
+        info "  Enabled iio-sensor-proxy"
+    else
+        info "  iio-sensor-proxy already enabled"
+    fi
+}
+
+setup_boot_bluetooth() {
+    # Set up Bluetooth keyboard support in initramfs so the keyboard
+    # can be used to enter LUKS passphrase at boot.
+    # Uses mkinitcpio-bluetooth from AUR.
+
+    info "Setting up boot-time Bluetooth keyboard support..."
+    echo ""
+
+    # Check that we're not using sd-encrypt (incompatible)
+    if [[ -f /etc/mkinitcpio.conf ]]; then
+        if grep -qE '^\s*HOOKS=.*\bsystemd\b' /etc/mkinitcpio.conf; then
+            error "Your mkinitcpio.conf uses the 'systemd' hook."
+            error "mkinitcpio-bluetooth is NOT compatible with the systemd hook."
+            error "You would need to switch from sd-encrypt to the traditional 'encrypt' hook."
+            error "Aborting."
+            exit 1
+        fi
+    else
+        error "/etc/mkinitcpio.conf not found. Is mkinitcpio installed?"
+        exit 1
+    fi
+
+    # Step 1: Ensure the keyboard is paired and trusted
+    info "Step 1: Verify Bluetooth keyboard is paired"
+    echo ""
+
+    if ! command -v bluetoothctl &>/dev/null; then
+        sudo pacman -S --needed --noconfirm bluez bluez-utils
+    fi
+
+    # Check for paired keyboards
+    local paired_devices
+    paired_devices="$(bluetoothctl devices Paired 2>/dev/null || true)"
+
+    if [[ -z "$paired_devices" ]]; then
+        warn "No paired Bluetooth devices found."
+        warn ""
+        warn "Please pair your keyboard first:"
+        warn "  1. Run: bluetoothctl"
+        warn "  2. Type: scan le"
+        warn "  3. Find your keyboard MAC address"
+        warn "  4. Type: connect XX:XX:XX:XX:XX:XX"
+        warn "  5. Accept pairing"
+        warn "  6. Type: trust XX:XX:XX:XX:XX:XX"
+        warn "  7. Type: scan off"
+        warn "  8. Type: exit"
+        warn ""
+        warn "Then run this command again."
+        exit 1
+    fi
+
+    info "  Found paired devices:"
+    echo "$paired_devices" | while read -r line; do
+        info "    $line"
+    done
+    echo ""
+
+    # Step 2: Ensure AutoEnable=true in bluetooth config
+    info "Step 2: Configure Bluetooth auto-enable"
+
+    local bt_conf="/etc/bluetooth/main.conf"
+    if [[ -f "$bt_conf" ]]; then
+        if grep -q '^AutoEnable=true' "$bt_conf"; then
+            info "  AutoEnable already set to true"
+        elif grep -q '^#\?AutoEnable=' "$bt_conf"; then
+            sudo sed -i 's/^#\?AutoEnable=.*/AutoEnable=true/' "$bt_conf"
+            info "  Set AutoEnable=true in $bt_conf"
+        else
+            echo 'AutoEnable=true' | sudo tee -a "$bt_conf" >/dev/null
+            info "  Added AutoEnable=true to $bt_conf"
+        fi
+    else
+        warn "  $bt_conf not found, skipping AutoEnable configuration"
+    fi
+    echo ""
+
+    # Step 3: Install mkinitcpio-bluetooth from AUR
+    info "Step 3: Install mkinitcpio-bluetooth"
+
+    if pacman -Qi mkinitcpio-bluetooth &>/dev/null; then
+        info "  mkinitcpio-bluetooth already installed"
+    else
+        # Detect AUR helper
+        local aur_helper=""
+        for helper in yay paru pikaur; do
+            if command -v "$helper" &>/dev/null; then
+                aur_helper="$helper"
+                break
+            fi
+        done
+
+        if [[ -z "$aur_helper" ]]; then
+            error "No AUR helper found (yay, paru, or pikaur)."
+            error "Install one first: sudo pacman -S yay"
+            error "Or install mkinitcpio-bluetooth manually from the AUR."
+            exit 1
+        fi
+
+        info "  Installing via $aur_helper..."
+        "$aur_helper" -S --needed --noconfirm mkinitcpio-bluetooth
+    fi
+    echo ""
+
+    # Step 4: Add bluetooth hook to mkinitcpio.conf
+    info "Step 4: Add bluetooth hook to mkinitcpio.conf"
+
+    local mkinit_conf="/etc/mkinitcpio.conf"
+    if grep -qE '^\s*HOOKS=.*\bbluetooth\b' "$mkinit_conf"; then
+        info "  bluetooth hook already present"
+    else
+        # Insert 'bluetooth' after 'keyboard' in the HOOKS array
+        if grep -qE '^\s*HOOKS=.*\bkeyboard\b' "$mkinit_conf"; then
+            sudo sed -i -E 's/(HOOKS=.*\bkeyboard\b)/\1 bluetooth/' "$mkinit_conf"
+            info "  Added bluetooth hook after keyboard"
+        else
+            # If no keyboard hook found, add before encrypt/block
+            if grep -qE '^\s*HOOKS=.*\bblock\b' "$mkinit_conf"; then
+                sudo sed -i -E 's/(HOOKS=.*)\bblock\b/\1bluetooth block/' "$mkinit_conf"
+                info "  Added bluetooth hook before block"
+            else
+                error "Could not find a suitable place to insert the bluetooth hook."
+                error "Please add 'bluetooth' to HOOKS manually in $mkinit_conf"
+                error "It should go after 'keyboard' and before 'encrypt'."
+                exit 1
+            fi
+        fi
+    fi
+
+    # Show the current HOOKS line
+    info "  Current HOOKS:"
+    info "  $(grep -E '^\s*HOOKS=' "$mkinit_conf")"
+    echo ""
+
+    # Step 5: Enable bluetooth service
+    info "Step 5: Enable bluetooth service"
+
+    if ! systemctl is-enabled bluetooth.service &>/dev/null; then
+        sudo systemctl enable bluetooth.service
+        info "  Enabled bluetooth.service"
+    else
+        info "  bluetooth.service already enabled"
+    fi
+    echo ""
+
+    # Step 6: Rebuild initramfs
+    info "Step 6: Rebuild initramfs"
+    warn "  This will regenerate initramfs with Bluetooth support."
+    warn "  Your keyboard pairing data will be included."
+    echo ""
+
+    sudo mkinitcpio -P
+    echo ""
+
+    info "Boot-time Bluetooth setup complete!"
+    info ""
+    info "Your Bluetooth keyboard should now work at the LUKS passphrase prompt."
+    info "Note: The keyboard may take a few seconds to connect at boot."
+    info "You can start typing your passphrase — keystrokes will be buffered."
+    info ""
+    warn "Keep a USB keyboard accessible as a fallback until you've verified this works."
+}
+
+do_install() {
+    info "Setting up ThinkPad X1 Fold for Omarchy..."
+    echo ""
+
+    install_packages
+    echo ""
+    link_scripts
+    echo ""
+    link_configs
+    echo ""
+    link_waybar
+    echo ""
+    enable_services
+
+    echo ""
+    info "Setup complete!"
+    info ""
+    info "Next steps:"
+    info "  1. Log out and back in (or reboot) to activate"
+    info "  2. Rotate the device to test auto-rotation"
+    info "  3. Press Super+Shift+L to toggle laptop mode"
+    info "  4. Press Super+Shift+K to toggle on-screen keyboard"
+    info "  5. Remove physical keyboard — OSK should appear automatically"
+    info ""
+    info "If the monitor name isn't eDP-1, check with 'hyprctl monitors'"
+    info "and set X1FOLD_MONITOR in your shell profile."
+    info ""
+    info "To also enable Bluetooth keyboard at boot (for LUKS unlock):"
+    info "  x1fold-setup --boot-bluetooth"
+}
+
+do_all() {
+    do_install
+    echo ""
+    echo "============================================"
+    echo ""
+    setup_boot_bluetooth
+}
+
+do_uninstall() {
+    info "Removing ThinkPad X1 Fold configuration..."
+
+    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk; do
+        local dst="$BIN_DIR/$script"
+        if [[ -L "$dst" ]]; then
+            rm "$dst"
+            info "  Removed $script"
+        fi
+    done
+
+    for conf in x1fold.conf x1fold-autostart.conf; do
+        local dst="$HYPR_DIR/$conf"
+        if [[ -L "$dst" ]]; then
+            rm "$dst"
+            info "  Removed $conf"
+        fi
+    done
+
+    local dst="$WAYBAR_DIR/x1fold-modules.json"
+    if [[ -L "$dst" ]]; then
+        rm "$dst"
+        info "  Removed x1fold-modules.json"
+    fi
+
+    warn "You may want to remove the 'source = ~/.config/hypr/x1fold.conf' line from hyprland.conf"
+
+    info "Uninstall complete."
+}
+
+case "${1:-}" in
+    --all)              do_all ;;
+    --boot-bluetooth)   setup_boot_bluetooth ;;
+    --uninstall)        do_uninstall ;;
+    ""|--install)       do_install ;;
+    *)
+        echo "Usage: x1fold-setup [--all|--install|--boot-bluetooth|--uninstall]" >&2
+        echo ""
+        echo "  (default)          Install configs, scripts, and packages"
+        echo "  --all              Install everything + boot-time Bluetooth"
+        echo "  --boot-bluetooth   Set up Bluetooth keyboard for LUKS unlock at boot"
+        echo "  --uninstall        Remove x1fold configs and symlinks"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+
+# Auto-rotation daemon for the ThinkPad X1 Fold 16 under Hyprland.
+# Listens to iio-sensor-proxy's monitor-sensor output and rotates
+# the display accordingly via hyprctl.
+#
+# Requires: iio-sensor-proxy
+# Usage: x1fold-rotate
+#
+# This script is meant to run as a background process, started from
+# Hyprland's autostart config.
+
+set -euo pipefail
+
+MONITOR="${X1FOLD_MONITOR:-eDP-1}"
+
+# Map accelerometer orientations to Hyprland transform values:
+#   normal          -> 0 (no rotation)
+#   left-up         -> 1 (90 degrees)
+#   bottom-up       -> 2 (180 degrees)
+#   right-up        -> 3 (270 degrees)
+
+apply_rotation() {
+    local orientation="$1"
+    local transform
+
+    case "$orientation" in
+        normal)     transform=0 ;;
+        left-up)    transform=1 ;;
+        bottom-up)  transform=2 ;;
+        right-up)   transform=3 ;;
+        *)          return ;;
+    esac
+
+    hyprctl keyword monitor "$MONITOR,preferred,auto,1,transform,$transform"
+}
+
+# Kill any existing monitor-sensor processes we started
+cleanup() {
+    kill "$SENSOR_PID" 2>/dev/null || true
+    exit 0
+}
+trap cleanup EXIT INT TERM
+
+# Start monitor-sensor and parse its output
+monitor-sensor 2>/dev/null | while read -r line; do
+    if [[ "$line" =~ "Accelerometer orientation changed:" ]]; then
+        orientation="${line##*: }"
+        apply_rotation "$orientation"
+    fi
+done &
+SENSOR_PID=$!
+
+wait "$SENSOR_PID"

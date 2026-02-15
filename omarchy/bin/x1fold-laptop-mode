@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+
+# Toggle laptop mode on the ThinkPad X1 Fold 16 under Hyprland.
+# When enabled, confines windows to the top half of the 2024x2560 display
+# so the bottom half can be used as a keyboard surface.
+#
+# Usage: x1fold-laptop-mode [toggle|on|off|status]
+#
+# Supports two approaches (set X1FOLD_LAPTOP_METHOD):
+#   resolution  - switches monitor to 2024x1280 (cleaner, but may not work on all Hyprland versions)
+#   reserved    - uses addreserved to block the bottom half (safer fallback)
+# Default: resolution
+
+set -euo pipefail
+
+STATE_FILE="${XDG_RUNTIME_DIR:-/tmp}/x1fold-laptop-mode"
+MONITOR="${X1FOLD_MONITOR:-eDP-1}"
+METHOD="${X1FOLD_LAPTOP_METHOD:-resolution}"
+
+FULL_RES="2024x2560"
+HALF_RES="2024x1280"
+HALF_HEIGHT=1280
+
+is_active() {
+    [[ -f "$STATE_FILE" ]]
+}
+
+laptop_on() {
+    if is_active; then
+        return 0
+    fi
+
+    case "$METHOD" in
+        resolution)
+            hyprctl keyword monitor "$MONITOR,${HALF_RES},0x0,1"
+            ;;
+        reserved)
+            hyprctl keyword monitor "$MONITOR,addreserved,0,${HALF_HEIGHT},0,0"
+            ;;
+    esac
+
+    touch "$STATE_FILE"
+}
+
+laptop_off() {
+    if ! is_active; then
+        return 0
+    fi
+
+    case "$METHOD" in
+        resolution)
+            hyprctl keyword monitor "$MONITOR,${FULL_RES},0x0,1"
+            ;;
+        reserved)
+            hyprctl keyword monitor "$MONITOR,addreserved,0,0,0,0"
+            ;;
+    esac
+
+    rm -f "$STATE_FILE"
+}
+
+laptop_toggle() {
+    if is_active; then
+        laptop_off
+    else
+        laptop_on
+    fi
+}
+
+laptop_status() {
+    if is_active; then
+        echo '{"text": "💻", "tooltip": "Laptop mode: ON", "class": "active"}'
+    else
+        echo '{"text": "📱", "tooltip": "Laptop mode: OFF", "class": "inactive"}'
+    fi
+}
+
+case "${1:-toggle}" in
+    on)      laptop_on ;;
+    off)     laptop_off ;;
+    toggle)  laptop_toggle ;;
+    status)  laptop_status ;;
+    *)
+        echo "Usage: x1fold-laptop-mode [toggle|on|off|status]" >&2
+        exit 1
+        ;;
+esac

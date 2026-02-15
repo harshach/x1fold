@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+
+# On-screen keyboard manager for the ThinkPad X1 Fold 16 under Hyprland.
+#
+# Uses wvkbd and monitors physical keyboard attachment. When no physical
+# keyboard is detected, wvkbd is shown automatically. When a physical
+# keyboard is attached, wvkbd is hidden.
+#
+# Usage:
+#   x1fold-osk toggle      # Manual show/hide toggle
+#   x1fold-osk show        # Show the keyboard
+#   x1fold-osk hide        # Hide the keyboard
+#   x1fold-osk daemon      # Run keyboard presence monitor (for autostart)
+#
+# Requires: wvkbd
+
+set -euo pipefail
+
+WVKBD_OPTS="${X1FOLD_WVKBD_OPTS:---landscape-layers full --hidden}"
+
+ensure_wvkbd() {
+    if ! pgrep -x wvkbd-mobintl >/dev/null 2>&1; then
+        # shellcheck disable=SC2086
+        wvkbd-mobintl $WVKBD_OPTS &
+        disown
+        sleep 0.3
+    fi
+}
+
+osk_show() {
+    ensure_wvkbd
+    pkill -SIGUSR2 wvkbd-mobintl 2>/dev/null || true
+}
+
+osk_hide() {
+    pkill -SIGUSR1 wvkbd-mobintl 2>/dev/null || true
+}
+
+osk_toggle() {
+    ensure_wvkbd
+    pkill -SIGRTMIN wvkbd-mobintl 2>/dev/null || true
+}
+
+has_physical_keyboard() {
+    # Check if any physical keyboard (non-virtual) is present.
+    # Look for keyboard devices that are real hardware (have a phys path).
+    if [[ -d /proc/bus/input ]]; then
+        # Look for keyboard-like devices with a physical bus attachment
+        grep -l "keyboard" /sys/class/input/*/device/name 2>/dev/null | while read -r f; do
+            local dev_dir
+            dev_dir="$(dirname "$(dirname "$f")")"
+            # Physical devices have a phys attribute that's non-empty and not "seat"
+            if [[ -f "$dev_dir/device/phys" ]]; then
+                local phys
+                phys="$(cat "$dev_dir/device/phys" 2>/dev/null || true)"
+                if [[ -n "$phys" && "$phys" != *"seat"* && "$phys" != *"input-method"* ]]; then
+                    echo "found"
+                    return
+                fi
+            fi
+        done | grep -q "found"
+    else
+        # Fallback: use libinput if /proc/bus/input isn't available
+        libinput list-devices 2>/dev/null | grep -qi "keyboard" && return 0
+        return 1
+    fi
+}
+
+osk_daemon() {
+    # Monitor for keyboard attach/detach events via udev and adjust OSK visibility.
+    ensure_wvkbd
+
+    # Set initial state
+    if has_physical_keyboard; then
+        osk_hide
+    else
+        osk_show
+    fi
+
+    # Watch for input device changes
+    stdbuf -oL udevadm monitor --subsystem-match=input --udev 2>/dev/null | while read -r line; do
+        if [[ "$line" =~ (add|remove).*input ]]; then
+            sleep 0.5  # let the device settle
+            if has_physical_keyboard; then
+                osk_hide
+            else
+                osk_show
+            fi
+        fi
+    done
+}
+
+case "${1:-toggle}" in
+    show)    osk_show ;;
+    hide)    osk_hide ;;
+    toggle)  osk_toggle ;;
+    daemon)  osk_daemon ;;
+    *)
+        echo "Usage: x1fold-osk [toggle|show|hide|daemon]" >&2
+        exit 1
+        ;;
+esac
