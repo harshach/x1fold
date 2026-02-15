@@ -28,7 +28,14 @@ install_packages() {
     info "Installing required packages..."
 
     # Official repo packages
-    local packages=(iio-sensor-proxy wvkbd)
+    local packages=(
+        iio-sensor-proxy    # accelerometer + ambient light sensor
+        wvkbd               # on-screen keyboard
+        fwupd               # firmware updates via LVFS
+        thermald            # thermal management for Intel hybrid CPUs
+        hypridle            # idle manager for OLED protection
+        hyprlock            # lock screen
+    )
     local to_install=()
 
     for pkg in "${packages[@]}"; do
@@ -48,7 +55,7 @@ link_scripts() {
     info "Linking scripts to $BIN_DIR..."
     mkdir -p "$BIN_DIR"
 
-    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk; do
+    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk x1fold-brightness x1fold-battery x1fold-oled-protect; do
         local src="$REPO_DIR/bin/$script"
         local dst="$BIN_DIR/$script"
 
@@ -117,6 +124,26 @@ link_waybar() {
     warn "See: $src"
 }
 
+setup_oled_protection() {
+    info "Setting up OLED burn-in protection..."
+    "$REPO_DIR/bin/x1fold-oled-protect" apply
+    info "  OLED protection configured"
+}
+
+setup_battery_thresholds() {
+    info "Setting battery charge thresholds for longevity..."
+
+    local start_thresh="/sys/class/power_supply/BAT0/charge_control_start_threshold"
+    if [[ -f "$start_thresh" ]]; then
+        "$REPO_DIR/bin/x1fold-battery" default
+        info "  Battery thresholds set to 80/90%"
+    else
+        warn "  Battery charge thresholds not available (may need thinkpad_acpi module)"
+        warn "  You can try: sudo modprobe thinkpad_acpi"
+        warn "  Then re-run setup"
+    fi
+}
+
 enable_services() {
     info "Enabling services..."
 
@@ -125,6 +152,20 @@ enable_services() {
         info "  Enabled iio-sensor-proxy"
     else
         info "  iio-sensor-proxy already enabled"
+    fi
+
+    if ! systemctl is-enabled thermald.service &>/dev/null; then
+        sudo systemctl enable --now thermald.service
+        info "  Enabled thermald (Intel thermal management)"
+    else
+        info "  thermald already enabled"
+    fi
+
+    if ! systemctl is-enabled fwupd.service &>/dev/null; then
+        sudo systemctl enable fwupd.service
+        info "  Enabled fwupd (firmware updates)"
+    else
+        info "  fwupd already enabled"
     fi
 }
 
@@ -302,17 +343,36 @@ do_install() {
     echo ""
     link_waybar
     echo ""
+    setup_oled_protection
+    echo ""
+    setup_battery_thresholds
+    echo ""
     enable_services
 
     echo ""
     info "Setup complete!"
     info ""
-    info "Next steps:"
-    info "  1. Log out and back in (or reboot) to activate"
-    info "  2. Rotate the device to test auto-rotation"
-    info "  3. Press Super+Shift+L to toggle laptop mode"
-    info "  4. Press Super+Shift+K to toggle on-screen keyboard"
-    info "  5. Remove physical keyboard — OSK should appear automatically"
+    info "What's configured:"
+    info "  - Auto-rotation via accelerometer"
+    info "  - On-screen keyboard (auto-shows without physical keyboard)"
+    info "  - HiDPI scaling at 1.5x with XWayland fix"
+    info "  - Pen/stylus support (Wacom AES)"
+    info "  - Touchscreen gestures (3-finger swipe for workspaces)"
+    info "  - OLED burn-in protection (dim/off/lock timeouts)"
+    info "  - Auto-brightness via ambient light sensor"
+    info "  - Battery charge thresholds (80/90% for longevity)"
+    info "  - Intel thermal management (thermald)"
+    info "  - Firmware update support (fwupd)"
+    info ""
+    info "Keybindings:"
+    info "  Super+Shift+L  Toggle laptop mode"
+    info "  Super+Shift+K  Toggle on-screen keyboard"
+    info ""
+    info "Useful commands:"
+    info "  x1fold-battery status     Check battery thresholds"
+    info "  x1fold-battery full       Temporarily charge to 100%"
+    info "  x1fold-brightness get     Check current brightness"
+    info "  fwupdmgr get-updates      Check for firmware updates"
     info ""
     info "If the monitor name isn't eDP-1, check with 'hyprctl monitors'"
     info "and set X1FOLD_MONITOR in your shell profile."
@@ -332,13 +392,19 @@ do_all() {
 do_uninstall() {
     info "Removing ThinkPad X1 Fold configuration..."
 
-    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk; do
+    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk x1fold-brightness x1fold-battery x1fold-oled-protect; do
         local dst="$BIN_DIR/$script"
         if [[ -L "$dst" ]]; then
             rm "$dst"
             info "  Removed $script"
         fi
     done
+
+    # Remove generated hypridle config
+    if [[ -f "$HYPR_DIR/hypridle-x1fold.conf" ]]; then
+        rm "$HYPR_DIR/hypridle-x1fold.conf"
+        info "  Removed hypridle-x1fold.conf"
+    fi
 
     for conf in x1fold.conf x1fold-autostart.conf; do
         local dst="$HYPR_DIR/$conf"

@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+
+# Auto-brightness daemon for the ThinkPad X1 Fold 16 under Hyprland.
+# Monitors the ambient light sensor via iio-sensor-proxy and adjusts
+# display brightness accordingly.
+#
+# Usage:
+#   x1fold-brightness daemon    # Run auto-brightness loop (for autostart)
+#   x1fold-brightness set PCT   # Manually set brightness (0-100)
+#   x1fold-brightness get       # Print current brightness percentage
+#
+# Requires: iio-sensor-proxy
+
+set -euo pipefail
+
+BACKLIGHT_DIR=""
+for dir in /sys/class/backlight/intel_backlight /sys/class/backlight/amdgpu_bl* /sys/class/backlight/acpi_video0; do
+    if [[ -d "$dir" ]]; then
+        BACKLIGHT_DIR="$dir"
+        break
+    fi
+done
+
+if [[ -z "$BACKLIGHT_DIR" ]]; then
+    echo "No backlight device found" >&2
+    exit 1
+fi
+
+MAX_BRIGHTNESS="$(cat "$BACKLIGHT_DIR/max_brightness")"
+
+# Min/max brightness percentages (don't go fully dark on OLED)
+MIN_PCT="${X1FOLD_BRIGHTNESS_MIN:-5}"
+MAX_PCT="${X1FOLD_BRIGHTNESS_MAX:-100}"
+
+# How often to sample (seconds)
+INTERVAL="${X1FOLD_BRIGHTNESS_INTERVAL:-3}"
+
+pct_to_raw() {
+    local pct="$1"
+    echo $(( pct * MAX_BRIGHTNESS / 100 ))
+}
+
+raw_to_pct() {
+    local raw="$1"
+    echo $(( raw * 100 / MAX_BRIGHTNESS ))
+}
+
+get_brightness() {
+    raw_to_pct "$(cat "$BACKLIGHT_DIR/brightness")"
+}
+
+set_brightness() {
+    local pct="$1"
+    if (( pct < MIN_PCT )); then pct=$MIN_PCT; fi
+    if (( pct > MAX_PCT )); then pct=$MAX_PCT; fi
+    local raw
+    raw="$(pct_to_raw "$pct")"
+    echo "$raw" | sudo tee "$BACKLIGHT_DIR/brightness" >/dev/null
+}
+
+# Map ambient light level (lux) to brightness percentage
+lux_to_brightness() {
+    local lux="$1"
+    if (( lux < 10 )); then
+        echo "$MIN_PCT"
+    elif (( lux < 50 )); then
+        echo 20
+    elif (( lux < 200 )); then
+        echo 40
+    elif (( lux < 500 )); then
+        echo 60
+    elif (( lux < 1000 )); then
+        echo 80
+    else
+        echo "$MAX_PCT"
+    fi
+}
+
+brightness_daemon() {
+    local prev_pct=-1
+
+    monitor-sensor 2>/dev/null | while read -r line; do
+        if [[ "$line" =~ "Light changed:" ]]; then
+            local lux
+            lux="$(echo "$line" | grep -oP '[\d.]+' | head -1)"
+            lux="${lux%%.*}"  # truncate to integer
+
+            if [[ -n "$lux" ]]; then
+                local target_pct
+                target_pct="$(lux_to_brightness "$lux")"
+
+                # Only change if different from last set value
+                if (( target_pct != prev_pct )); then
+                    set_brightness "$target_pct"
+                    prev_pct=$target_pct
+                fi
+            fi
+        fi
+    done
+}
+
+case "${1:-daemon}" in
+    daemon)
+        brightness_daemon
+        ;;
+    get)
+        echo "$(get_brightness)%"
+        ;;
+    set)
+        if [[ -z "${2:-}" ]]; then
+            echo "Usage: x1fold-brightness set PERCENT" >&2
+            exit 1
+        fi
+        set_brightness "$2"
+        ;;
+    *)
+        echo "Usage: x1fold-brightness [daemon|get|set PCT]" >&2
+        exit 1
+        ;;
+esac

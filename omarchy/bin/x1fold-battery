@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+
+# Battery charge threshold management for the ThinkPad X1 Fold 16.
+# Sets start/stop charge thresholds to preserve battery longevity,
+# especially important for OLED devices.
+#
+# Usage:
+#   x1fold-battery status           # Show current thresholds and charge
+#   x1fold-battery set START STOP   # Set charge thresholds (e.g. 80 90)
+#   x1fold-battery full             # Temporarily charge to 100%
+#   x1fold-battery default          # Reset to longevity defaults (80/90)
+#
+# ThinkPad battery thresholds:
+#   start = stop charging below this %
+#   stop  = start charging above this %
+
+set -euo pipefail
+
+BAT="BAT0"
+START_THRESH="/sys/class/power_supply/$BAT/charge_control_start_threshold"
+STOP_THRESH="/sys/class/power_supply/$BAT/charge_control_end_threshold"
+
+DEFAULT_START=80
+DEFAULT_STOP=90
+
+check_support() {
+    if [[ ! -f "$START_THRESH" || ! -f "$STOP_THRESH" ]]; then
+        echo "Battery charge thresholds not supported on this system." >&2
+        echo "Expected: $START_THRESH" >&2
+        echo "Install TLP or check if your kernel supports thinkpad_acpi." >&2
+        exit 1
+    fi
+}
+
+battery_status() {
+    check_support
+
+    local capacity charge_status start stop
+    capacity="$(cat "/sys/class/power_supply/$BAT/capacity" 2>/dev/null || echo "?")"
+    charge_status="$(cat "/sys/class/power_supply/$BAT/status" 2>/dev/null || echo "?")"
+    start="$(cat "$START_THRESH" 2>/dev/null || echo "?")"
+    stop="$(cat "$STOP_THRESH" 2>/dev/null || echo "?")"
+
+    echo "Battery:    ${capacity}% (${charge_status})"
+    echo "Start at:   ${start}%"
+    echo "Stop at:    ${stop}%"
+}
+
+battery_set() {
+    check_support
+
+    local start="$1"
+    local stop="$2"
+
+    if (( start < 0 || start > 100 || stop < 0 || stop > 100 )); then
+        echo "Thresholds must be between 0 and 100" >&2
+        exit 1
+    fi
+
+    if (( start >= stop )); then
+        echo "Start threshold must be less than stop threshold" >&2
+        exit 1
+    fi
+
+    # Must set stop first if increasing, start first if decreasing
+    echo "$stop" | sudo tee "$STOP_THRESH" >/dev/null
+    echo "$start" | sudo tee "$START_THRESH" >/dev/null
+
+    echo "Charge thresholds set: start=${start}%, stop=${stop}%"
+}
+
+case "${1:-status}" in
+    status)
+        battery_status
+        ;;
+    set)
+        if [[ -z "${2:-}" || -z "${3:-}" ]]; then
+            echo "Usage: x1fold-battery set START STOP" >&2
+            echo "Example: x1fold-battery set 80 90" >&2
+            exit 1
+        fi
+        battery_set "$2" "$3"
+        ;;
+    full)
+        battery_set 0 100
+        echo "Charging to 100%. Run 'x1fold-battery default' when done."
+        ;;
+    default)
+        battery_set $DEFAULT_START $DEFAULT_STOP
+        ;;
+    *)
+        echo "Usage: x1fold-battery [status|set START STOP|full|default]" >&2
+        exit 1
+        ;;
+esac
