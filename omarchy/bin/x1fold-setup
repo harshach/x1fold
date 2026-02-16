@@ -96,7 +96,7 @@ link_scripts() {
     info "Linking scripts to $BIN_DIR..."
     mkdir -p "$BIN_DIR"
 
-    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk x1fold-brightness x1fold-battery x1fold-oled-protect; do
+    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk x1fold-brightness x1fold-battery x1fold-oled-protect x1fold-battery-waybar x1fold-notification-focus; do
         local src="$REPO_DIR/bin/$script"
         local dst="$BIN_DIR/$script"
 
@@ -833,7 +833,7 @@ do_uninstall() {
     uninstall_power_tuning
     uninstall_hibernate
 
-    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk x1fold-brightness x1fold-battery x1fold-oled-protect; do
+    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk x1fold-brightness x1fold-battery x1fold-oled-protect x1fold-battery-waybar x1fold-notification-focus; do
         local dst="$BIN_DIR/$script"
         if [[ -L "$dst" ]]; then
             rm "$dst"

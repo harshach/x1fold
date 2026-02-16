@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+
+# Focus the window that sent a mako notification.
+# Called from mako config: on-touch=exec x1fold-notification-focus "$id"
+#
+# Strategy:
+# 1. Get app-name from notification (before any dismiss)
+# 2. Focus window by matching app-name to Hyprland window class
+# 3. Try makoctl invoke (for apps that register a default action)
+# 4. Dismiss the notification if no window was focused
+
+nid="$1"
+[ -z "$nid" ] && exit 1
+
+# Get app name before we dismiss anything
+app_name=$(makoctl list 2>/dev/null | awk -v id="Notification ${nid}:" '
+  index($0, id) { found=1; next }
+  found && /App name:/ { sub(/^[[:space:]]*App name: /, ""); print; exit }
+')
+
+# Focus window by matching app-name to Hyprland window class
+focused=false
+if [ -n "$app_name" ]; then
+    match=$(hyprctl clients -j 2>/dev/null | python3 -c "
+import json, sys
+app = sys.argv[1].lower()
+clients = json.load(sys.stdin)
+for c in sorted(clients, key=lambda x: x.get('focusHistoryID', 999)):
+    cls = c.get('class', '').lower()
+    if app in cls or cls.split('.')[-1] in app or app in cls.split('.')[-1]:
+        print(c.get('address', ''))
+        break
+" "$app_name" 2>/dev/null)
+
+    if [ -n "$match" ]; then
+        hyprctl dispatch focuswindow "address:$match" >/dev/null 2>&1
+        focused=true
+    fi
+fi
+
+# Also try makoctl invoke for apps with registered default actions
+makoctl invoke -n "$nid" >/dev/null 2>&1
+
+# Dismiss if no window was focused
+if [ "$focused" = false ]; then
+    makoctl dismiss -n "$nid" >/dev/null 2>&1
+fi
