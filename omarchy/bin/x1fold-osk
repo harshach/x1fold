@@ -2,9 +2,13 @@
 
 # On-screen keyboard manager for the ThinkPad X1 Fold 16 under Hyprland.
 #
-# Uses wvkbd and monitors physical keyboard attachment. When no physical
-# keyboard is detected, wvkbd is shown automatically. When a physical
-# keyboard is attached, wvkbd is hidden.
+# Uses wvkbd with two auto-show mechanisms:
+#   1. input-method-v2 protocol: wvkbd auto-shows when apps focus a text
+#      input field (GTK, Qt, etc.)
+#   2. Hyprland IPC: for terminals (which don't use text-input-v3), the
+#      daemon detects terminal window focus and force-shows wvkbd.
+#
+# When a physical keyboard is connected, wvkbd is killed entirely.
 #
 # Usage:
 #   x1fold-osk toggle      # Manual show/hide toggle
@@ -12,11 +16,14 @@
 #   x1fold-osk hide        # Hide the keyboard
 #   x1fold-osk daemon      # Run keyboard presence monitor (for autostart)
 #
-# Requires: wvkbd
+# Requires: wvkbd, socat
 
 set -euo pipefail
 
 WVKBD_OPTS="${X1FOLD_WVKBD_OPTS:---landscape-layers full --hidden}"
+TERMINAL_CLASSES="${X1FOLD_TERMINAL_CLASSES:-Alacritty|kitty|ghostty|com\.mitchellh\.ghostty|foot|org\.wezfurlong\.wezterm}"
+KB_STATE_FILE="${XDG_RUNTIME_DIR:-/tmp}/x1fold-kb-present"
+OSK_DISMISSED_FILE="${XDG_RUNTIME_DIR:-/tmp}/x1fold-osk-dismissed"
 
 ensure_wvkbd() {
     if ! pgrep -x wvkbd-mobintl >/dev/null 2>&1; then
@@ -34,60 +41,141 @@ osk_show() {
 
 osk_hide() {
     pkill -SIGUSR1 wvkbd-mobintl 2>/dev/null || true
+    # Mark as manually dismissed so the daemon doesn't re-show
+    touch "$OSK_DISMISSED_FILE"
 }
 
 osk_toggle() {
     ensure_wvkbd
     pkill -SIGRTMIN wvkbd-mobintl 2>/dev/null || true
+    # Mark as dismissed (toggle assumed to be hiding if daemon was showing)
+    touch "$OSK_DISMISSED_FILE"
 }
 
 has_physical_keyboard() {
-    # Check if any physical keyboard (non-virtual) is present.
-    # Look for keyboard devices that are real hardware (have a phys path).
-    if [[ -d /proc/bus/input ]]; then
-        # Look for keyboard-like devices with a physical bus attachment
-        grep -l "keyboard" /sys/class/input/*/device/name 2>/dev/null | while read -r f; do
-            local dev_dir
-            dev_dir="$(dirname "$(dirname "$f")")"
-            # Physical devices have a phys attribute that's non-empty and not "seat"
-            if [[ -f "$dev_dir/device/phys" ]]; then
-                local phys
-                phys="$(cat "$dev_dir/device/phys" 2>/dev/null || true)"
-                if [[ -n "$phys" && "$phys" != *"seat"* && "$phys" != *"input-method"* ]]; then
-                    echo "found"
-                    return
-                fi
-            fi
-        done | grep -q "found"
-    else
-        # Fallback: use libinput if /proc/bus/input isn't available
-        libinput list-devices 2>/dev/null | grep -qi "keyboard" && return 0
-        return 1
-    fi
+    # Check if a real external keyboard (USB or Bluetooth) is present.
+    # The X1 Fold has no built-in keyboard, but the PS/2 controller stub
+    # ("AT Translated Set 2 keyboard" at isa0060/serio0) is always present.
+    # We skip it and only match USB/Bluetooth keyboards.
+    local dev_dir name phys
+    for dev_dir in /sys/class/input/event*/device; do
+        [[ -f "$dev_dir/name" ]] || continue
+        name="$(cat "$dev_dir/name" 2>/dev/null || true)"
+
+        # Only consider devices with "keyboard" in the name (case-insensitive)
+        [[ "${name,,}" == *keyboard* ]] || continue
+
+        # Skip companion devices (Mouse, Touchpad) — only match actual keyboards
+        [[ "${name,,}" == *mouse* || "${name,,}" == *touchpad* ]] && continue
+
+        phys="$(cat "$dev_dir/phys" 2>/dev/null || true)"
+
+        # Skip the PS/2 stub (always present on X1 Fold, not a real keyboard)
+        [[ "$phys" == isa0060* ]] && continue
+
+        # Skip virtual/seat devices
+        [[ -z "$phys" || "$phys" == *seat* || "$phys" == *input-method* ]] && continue
+
+        # Found a real external keyboard
+        return 0
+    done
+    return 1
 }
 
-osk_daemon() {
-    # Monitor for keyboard attach/detach events via udev and adjust OSK visibility.
-    ensure_wvkbd
+is_terminal_class() {
+    [[ "$1" =~ ^($TERMINAL_CLASSES)$ ]]
+}
 
-    # Set initial state
-    if has_physical_keyboard; then
-        osk_hide
-    else
-        osk_show
-    fi
-
-    # Watch for input device changes
+monitor_keyboard_presence() {
+    # Background job: watch udev for keyboard attach/detach and update state file.
     stdbuf -oL udevadm monitor --subsystem-match=input --udev 2>/dev/null | while read -r line; do
         if [[ "$line" =~ (add|remove).*input ]]; then
             sleep 0.5  # let the device settle
             if has_physical_keyboard; then
-                osk_hide
+                touch "$KB_STATE_FILE"
+                pkill -x wvkbd-mobintl 2>/dev/null || true
             else
-                osk_show
+                rm -f "$KB_STATE_FILE"
+                ensure_wvkbd
+                # If a terminal is already focused, show immediately
+                local class
+                class="$(hyprctl activewindow -j 2>/dev/null | jq -r '.class // ""' 2>/dev/null)"
+                if is_terminal_class "$class"; then
+                    osk_show
+                fi
             fi
         fi
     done
+}
+
+monitor_active_window() {
+    # Foreground job: watch Hyprland IPC for window focus changes.
+    # Terminals don't implement text-input-v3, so we force-show wvkbd
+    # when a terminal is focused. For other apps, we hide and let
+    # input-method-v2 auto-show for text fields.
+    #
+    # Respects manual dismissal: if the user hides via toggle/hide,
+    # we don't re-show until the active window changes.
+    local socket="${XDG_RUNTIME_DIR}/hypr/${HYPRLAND_INSTANCE_SIGNATURE}/.socket2.sock"
+    local prev_class=""
+
+    socat -U - "UNIX-CONNECT:$socket" 2>/dev/null | while read -r event; do
+        case "$event" in
+            activewindow\>\>*)
+                # Skip if physical keyboard is present
+                [[ -f "$KB_STATE_FILE" ]] && continue
+
+                # Parse class from "activewindow>>CLASS,TITLE"
+                local class="${event#activewindow>>}"
+                class="${class%%,*}"
+
+                # Clear dismissed state when window changes
+                if [[ "$class" != "$prev_class" ]]; then
+                    rm -f "$OSK_DISMISSED_FILE"
+                    prev_class="$class"
+                fi
+
+                # Don't re-show if user manually dismissed
+                [[ -f "$OSK_DISMISSED_FILE" ]] && continue
+
+                # Auto-show for terminals (they don't use text-input-v3).
+                # For other apps, preserve current visibility — user can
+                # toggle manually with Super+Shift+K.
+                if is_terminal_class "$class"; then
+                    osk_show
+                fi
+                ;;
+        esac
+    done
+}
+
+osk_daemon() {
+    # Two-source monitor:
+    #   1. udev — keyboard attach/detach (start/kill wvkbd)
+    #   2. Hyprland IPC — active window focus (show wvkbd for terminals,
+    #      let input-method-v2 handle text fields in other apps)
+
+    if ! command -v socat &>/dev/null; then
+        echo "Error: socat is required for OSK daemon (sudo pacman -S socat)" >&2
+        exit 1
+    fi
+
+    # Initial keyboard state
+    if has_physical_keyboard; then
+        touch "$KB_STATE_FILE"
+        pkill -x wvkbd-mobintl 2>/dev/null || true
+    else
+        rm -f "$KB_STATE_FILE"
+        ensure_wvkbd
+    fi
+
+    # Start keyboard presence monitor in background
+    monitor_keyboard_presence &
+    local udev_pid=$!
+    trap "kill $udev_pid 2>/dev/null; rm -f '$KB_STATE_FILE'" EXIT
+
+    # Monitor active window in foreground
+    monitor_active_window
 }
 
 case "${1:-toggle}" in

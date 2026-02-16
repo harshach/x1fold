@@ -1,0 +1,71 @@
+--- a/drivers/platform/x86/lenovo/thinkpad_acpi.c
++++ b/drivers/platform/x86/lenovo/thinkpad_acpi.c
+@@ -81,7 +81,7 @@
+ #include <sound/core.h>
+ #include <sound/initval.h>
+
+-#include "../dual_accel_detect.h"
++#include "dual_accel_detect.h"
+
+ /* ThinkPad CMOS commands */
+ #define TP_CMOS_VOLUME_DOWN	0
+@@ -2005,6 +2005,14 @@
+ 			      TP_ACPI_MULTI_MODE_STAND |
+ 			      TP_ACPI_MULTI_MODE_TENT;
+ 		break;
++	case 6:
++		/* Foldable device (e.g. ThinkPad X1 Fold).
++		 * Value 1 = laptop (screen folded, keyboard on bottom half).
++		 * Value 2 = tablet (screen fully open, no keyboard surface).
++		 */
++		valid_modes = TP_ACPI_MULTI_MODE_LAPTOP |
++			      TP_ACPI_MULTI_MODE_TABLET;
++		break;
+ 	default:
+ 		pr_err("Unknown multi mode status type %d with value 0x%04X, please report this to %s\n",
+ 		       type, value, TPACPI_MAIL);
+@@ -2016,10 +2024,18 @@
+
+ 	switch (value) {
+ 	case 1:
+-		mode = TP_ACPI_MULTI_MODE_LAPTOP;
++		/* Type 6 (foldable): value 1 = fully open/flat = tablet */
++		if (type == 6)
++			mode = TP_ACPI_MULTI_MODE_TABLET;
++		else
++			mode = TP_ACPI_MULTI_MODE_LAPTOP;
+ 		break;
+ 	case 2:
+-		mode = TP_ACPI_MULTI_MODE_FLAT;
++		/* Type 6 (foldable): value 2 = folded/laptop mode */
++		if (type == 6)
++			mode = TP_ACPI_MULTI_MODE_LAPTOP;
++		else
++			mode = TP_ACPI_MULTI_MODE_FLAT;
+ 		break;
+ 	case 3:
+ 		mode = TP_ACPI_MULTI_MODE_TABLET;
+@@ -2064,7 +2080,22 @@
+ 		if (!acpi_evalf(hkey_handle, &s, "GMMS", "dd", 0))
+ 			return -EIO;
+
+-		*status = hotkey_gmms_get_tablet_mode(s, NULL);
++		/*
++		 * For type 6 (foldable) devices like the ThinkPad X1 Fold,
++		 * use the EC CMMD register (0xC1) dock bit instead of GMMS
++		 * fold state.  Bit 7 of CMMD indicates keyboard magnetically
++		 * attached (1 = docked/laptop, 0 = undocked/tablet).
++		 */
++		if (((s >> 16) & 0xffff) == 6) {
++			u8 cmmd;
++
++			if (acpi_ec_read(0xc1, &cmmd))
++				*status = (cmmd >> 7) & 1;
++			else
++				*status = hotkey_gmms_get_tablet_mode(s, NULL);
++		} else {
++			*status = hotkey_gmms_get_tablet_mode(s, NULL);
++		}
+ 		break;
+ 	default:
+ 		break;

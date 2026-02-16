@@ -4,22 +4,29 @@
 # When enabled, confines windows to the top half of the 2024x2560 display
 # so the bottom half can be used as a keyboard surface.
 #
-# Usage: x1fold-laptop-mode [toggle|on|off|status]
+# Uses addreserved to block the bottom half — tiled windows are confined
+# to the top half. The bottom half is blacked out (OLED pixels off).
 #
-# Supports two approaches (set X1FOLD_LAPTOP_METHOD):
-#   resolution  - switches monitor to 2024x1280 (cleaner, but may not work on all Hyprland versions)
-#   reserved    - uses addreserved to block the bottom half (safer fallback)
-# Default: resolution
-
-set -euo pipefail
+# Usage: x1fold-laptop-mode [toggle|on|off|status|daemon]
+#
+# The "daemon" subcommand polls the thinkpad_acpi GMMS sensor and
+# automatically switches laptop mode when the screen is folded or the
+# keyboard is magnetically attached.
 
 STATE_FILE="${XDG_RUNTIME_DIR:-/tmp}/x1fold-laptop-mode"
+WALLPAPER_PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/x1fold-laptop-swaybg-pid"
 MONITOR="${X1FOLD_MONITOR:-eDP-1}"
-METHOD="${X1FOLD_LAPTOP_METHOD:-resolution}"
+WALLPAPER="${HOME}/.config/omarchy/current/background"
 
-FULL_RES="2024x2560"
-HALF_RES="2024x1280"
-HALF_HEIGHT=1280
+TABLET_MODE_FILE="/sys/devices/platform/thinkpad_acpi/hotkey_tablet_mode"
+
+get_reserved_bottom() {
+    # Calculate bottom reservation in logical pixels (half the logical height)
+    local logical_height
+    logical_height=$(hyprctl monitors -j 2>/dev/null \
+        | jq -r ".[] | select(.name == \"$MONITOR\") | (.height / .scale | floor)" 2>/dev/null)
+    echo $(( logical_height / 2 ))
+}
 
 is_active() {
     [[ -f "$STATE_FILE" ]]
@@ -30,14 +37,16 @@ laptop_on() {
         return 0
     fi
 
-    case "$METHOD" in
-        resolution)
-            hyprctl keyword monitor "$MONITOR,${HALF_RES},0x0,1"
-            ;;
-        reserved)
-            hyprctl keyword monitor "$MONITOR,addreserved,0,${HALF_HEIGHT},0,0"
-            ;;
-    esac
+    local reserve
+    reserve="$(get_reserved_bottom)"
+
+    hyprctl keyword monitor "$MONITOR,addreserved,0,$reserve,0,0" || return
+
+    # Black out the bottom half (OLED pixels off) by swapping wallpaper to solid black
+    pkill -x swaybg 2>/dev/null
+    sleep 0.1
+    swaybg -c '#000000' &
+    echo $! > "$WALLPAPER_PID_FILE"
 
     touch "$STATE_FILE"
 }
@@ -47,16 +56,15 @@ laptop_off() {
         return 0
     fi
 
-    case "$METHOD" in
-        resolution)
-            hyprctl keyword monitor "$MONITOR,${FULL_RES},0x0,1"
-            ;;
-        reserved)
-            hyprctl keyword monitor "$MONITOR,addreserved,0,0,0,0"
-            ;;
-    esac
+    hyprctl keyword monitor "$MONITOR,addreserved,0,0,0,0" || return
 
-    rm -f "$STATE_FILE"
+    # Restore original wallpaper
+    pkill -x swaybg 2>/dev/null
+    sleep 0.1
+    swaybg -i "$WALLPAPER" -m fill &
+    disown
+
+    rm -f "$STATE_FILE" "$WALLPAPER_PID_FILE"
 }
 
 laptop_toggle() {
@@ -69,10 +77,43 @@ laptop_toggle() {
 
 laptop_status() {
     if is_active; then
-        echo '{"text": "💻", "tooltip": "Laptop mode: ON", "class": "active"}'
+        echo '{"text": "\ud83d\udcbb", "tooltip": "Laptop mode: ON", "class": "active"}'
     else
-        echo '{"text": "📱", "tooltip": "Laptop mode: OFF", "class": "inactive"}'
+        echo '{"text": "\ud83d\udcf1", "tooltip": "Laptop mode: OFF", "class": "inactive"}'
     fi
+}
+
+laptop_daemon() {
+    # Poll the thinkpad_acpi GMMS tablet mode sensor and switch
+    # laptop mode automatically.
+    #
+    # hotkey_tablet_mode values (with our patched type 6 support):
+    #   0 = tablet mode (screen open, no keyboard)
+    #   1 = laptop mode (screen folded OR keyboard attached)
+
+    if [[ ! -f "$TABLET_MODE_FILE" ]]; then
+        echo "Error: $TABLET_MODE_FILE not found." >&2
+        echo "Is the patched thinkpad_acpi module loaded?" >&2
+        exit 1
+    fi
+
+    local prev_mode=""
+
+    while true; do
+        local tablet_mode
+        tablet_mode="$(cat "$TABLET_MODE_FILE" 2>/dev/null)" || continue
+
+        if [[ "$tablet_mode" != "$prev_mode" ]]; then
+            if [[ "$tablet_mode" == "0" ]]; then
+                laptop_off
+            else
+                laptop_on
+            fi
+            prev_mode="$tablet_mode"
+        fi
+
+        sleep 1
+    done
 }
 
 case "${1:-toggle}" in
@@ -80,8 +121,9 @@ case "${1:-toggle}" in
     off)     laptop_off ;;
     toggle)  laptop_toggle ;;
     status)  laptop_status ;;
+    daemon)  laptop_daemon ;;
     *)
-        echo "Usage: x1fold-laptop-mode [toggle|on|off|status]" >&2
+        echo "Usage: x1fold-laptop-mode [toggle|on|off|status|daemon]" >&2
         exit 1
         ;;
 esac

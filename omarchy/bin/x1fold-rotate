@@ -4,21 +4,27 @@
 # Listens to iio-sensor-proxy's monitor-sensor output and rotates
 # the display accordingly via hyprctl.
 #
-# Requires: iio-sensor-proxy
+# Requires: iio-sensor-proxy, jq
 # Usage: x1fold-rotate
 #
 # This script is meant to run as a background process, started from
 # Hyprland's autostart config.
 
-set -euo pipefail
-
 MONITOR="${X1FOLD_MONITOR:-eDP-1}"
+
+CURRENT_TRANSFORM=""
 
 # Map accelerometer orientations to Hyprland transform values:
 #   normal          -> 0 (no rotation)
 #   left-up         -> 1 (90 degrees)
 #   bottom-up       -> 2 (180 degrees)
 #   right-up        -> 3 (270 degrees)
+
+get_monitor_scale() {
+    hyprctl monitors -j 2>/dev/null \
+        | jq -r ".[] | select(.name == \"$MONITOR\") | .scale" 2>/dev/null \
+        || echo "1.6"
+}
 
 apply_rotation() {
     local orientation="$1"
@@ -32,23 +38,46 @@ apply_rotation() {
         *)          return ;;
     esac
 
-    hyprctl keyword monitor "$MONITOR,preferred,auto,1,transform,$transform"
+    # Skip if transform hasn't changed
+    [[ "$transform" == "$CURRENT_TRANSFORM" ]] && return
+
+    local scale
+    scale="$(get_monitor_scale)"
+
+    hyprctl keyword monitor "$MONITOR,preferred,auto,$scale,transform,$transform" || return
+    CURRENT_TRANSFORM="$transform"
+
+    # Re-apply laptop mode reservation if active (rotation resets addreserved)
+    local state_file="${XDG_RUNTIME_DIR:-/tmp}/x1fold-laptop-mode"
+    if [[ -f "$state_file" && "$transform" == "0" ]]; then
+        # Only reserve bottom half in normal orientation (portrait)
+        # Rotated orientations use the full screen (book-fold mode)
+        local logical_height
+        logical_height=$(hyprctl monitors -j 2>/dev/null \
+            | jq -r ".[] | select(.name == \"$MONITOR\") | (.height / .scale | floor)" 2>/dev/null)
+        local reserve=$(( logical_height / 2 ))
+        hyprctl keyword monitor "$MONITOR,addreserved,0,$reserve,0,0" || true
+    fi
 }
 
-# Kill any existing monitor-sensor processes we started
+# Use a named pipe so we can track the monitor-sensor PID for clean shutdown
+FIFO="$(mktemp -u /tmp/x1fold-rotate.XXXXXX)"
+mkfifo "$FIFO"
+
 cleanup() {
-    kill "$SENSOR_PID" 2>/dev/null || true
+    [[ -n "${SENSOR_PID:-}" ]] && kill "$SENSOR_PID" 2>/dev/null
+    rm -f "$FIFO"
+    wait 2>/dev/null
     exit 0
 }
 trap cleanup EXIT INT TERM
 
-# Start monitor-sensor and parse its output
-monitor-sensor 2>/dev/null | while read -r line; do
-    if [[ "$line" =~ "Accelerometer orientation changed:" ]]; then
+monitor-sensor > "$FIFO" 2>/dev/null &
+SENSOR_PID=$!
+
+while read -r line; do
+    if [[ "$line" == *"Accelerometer orientation changed:"* ]]; then
         orientation="${line##*: }"
         apply_rotation "$orientation"
     fi
-done &
-SENSOR_PID=$!
-
-wait "$SENSOR_PID"
+done < "$FIFO"
