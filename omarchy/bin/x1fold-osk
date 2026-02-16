@@ -155,6 +155,15 @@ osk_daemon() {
     #   2. Hyprland IPC — active window focus (show wvkbd for terminals,
     #      let input-method-v2 handle text fields in other apps)
 
+    local pidfile="${XDG_RUNTIME_DIR:-/tmp}/x1fold-osk-daemon.pid"
+
+    # Prevent multiple daemon instances
+    if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+        echo "OSK daemon already running (pid $(cat "$pidfile"))" >&2
+        exit 0
+    fi
+    echo $$ > "$pidfile"
+
     if ! command -v socat &>/dev/null; then
         echo "Error: socat is required for OSK daemon (sudo pacman -S socat)" >&2
         exit 1
@@ -172,7 +181,7 @@ osk_daemon() {
     # Start keyboard presence monitor in background
     monitor_keyboard_presence &
     local udev_pid=$!
-    trap "kill $udev_pid 2>/dev/null; rm -f '$KB_STATE_FILE'" EXIT
+    trap "kill $udev_pid 2>/dev/null; rm -f '$KB_STATE_FILE' '$pidfile'" EXIT
 
     # Monitor active window in foreground
     monitor_active_window

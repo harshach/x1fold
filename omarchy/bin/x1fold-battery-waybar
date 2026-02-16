@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+
+# Waybar custom battery module for ThinkPad X1 Fold 16.
+# Outputs JSON with battery icon, capacity, and a tooltip
+# that includes power draw, charge thresholds, and power profile.
+
+BAT="BAT0"
+SYS="/sys/class/power_supply/$BAT"
+
+capacity="$(cat "$SYS/capacity" 2>/dev/null || echo 0)"
+status="$(cat "$SYS/status" 2>/dev/null || echo "Unknown")"
+
+# Power in watts (convert from microwatts)
+power_uw="$(cat "$SYS/power_now" 2>/dev/null || echo 0)"
+power="$(awk "BEGIN { printf \"%.1f\", $power_uw / 1000000 }")"
+
+# Charge thresholds
+start="$(cat "$SYS/charge_control_start_threshold" 2>/dev/null || echo "?")"
+stop="$(cat "$SYS/charge_control_end_threshold" 2>/dev/null || echo "?")"
+
+# Power profile
+profile="$(powerprofilesctl get 2>/dev/null || echo "unknown")"
+
+# Choose icon based on status and capacity
+charging_icons=(󰢜 󰂆 󰂇 󰂈 󰢝 󰂉 󰢞 󰂊 󰂋 󰂅)
+default_icons=(󰁺 󰁻 󰁼 󰁽 󰁾 󰁿 󰂀 󰂁 󰂂 󰁹)
+
+idx=$(( capacity / 10 ))
+(( idx > 9 )) && idx=9
+
+case "$status" in
+    Charging)    icon="${charging_icons[$idx]}"; arrow="↑" ;;
+    Discharging) icon="${default_icons[$idx]}";  arrow="↓" ;;
+    Full)        icon="󰂅"; arrow="" ;;
+    *)           icon=""; arrow="" ;;
+esac
+
+# Build tooltip
+tooltip="${power}W${arrow} ${capacity}%"
+tooltip+="\nProfile: ${profile}"
+tooltip+="\nThresholds: ${start}–${stop}%"
+
+# Determine CSS class for warning/critical states
+class=""
+if (( capacity <= 10 )); then
+    class="critical"
+elif (( capacity <= 20 )); then
+    class="warning"
+fi
+
+# Output JSON for waybar
+printf '{"text": "%s", "tooltip": "%s", "class": "%s", "percentage": %d}\n' \
+    "$icon" "$tooltip" "$class" "$capacity"
