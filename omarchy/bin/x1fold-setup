@@ -25,6 +25,71 @@ info()  { echo -e "${GREEN}[x1fold]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[x1fold]${NC} $*"; }
 error() { echo -e "${RED}[x1fold]${NC} $*" >&2; }
 
+add_mkinitcpio_hook() {
+    # Add a hook to the HOOKS array in mkinitcpio config files.
+    # Checks both /etc/mkinitcpio.conf and any .conf.d/ drop-ins that
+    # override HOOKS (Omarchy uses /etc/mkinitcpio.conf.d/omarchy_hooks.conf).
+    #
+    # Usage: add_mkinitcpio_hook <hook_name> <after_hook>
+    #   hook_name: the hook to add (e.g. "bluetooth")
+    #   after_hook: insert after this hook (e.g. "keyboard")
+
+    local hook="$1"
+    local after="$2"
+    local added=false
+
+    # Collect all config files that define HOOKS
+    local configs=()
+    [[ -f /etc/mkinitcpio.conf ]] && configs+=(/etc/mkinitcpio.conf)
+    for f in /etc/mkinitcpio.conf.d/*.conf; do
+        [[ -f "$f" ]] && grep -qE '^\s*HOOKS=' "$f" && configs+=("$f")
+    done
+
+    for conf in "${configs[@]}"; do
+        if grep -qE "^\s*HOOKS=.*\b${hook}\b" "$conf"; then
+            info "  ${hook} hook already present in $conf"
+        elif grep -qE "^\s*HOOKS=.*\b${after}\b" "$conf"; then
+            sudo sed -i -E "s/(HOOKS=.*\b${after}\b)/\1 ${hook}/" "$conf"
+            info "  Added ${hook} hook after ${after} in $conf"
+            added=true
+        else
+            warn "  Could not find '${after}' hook in $conf to insert '${hook}' after"
+        fi
+    done
+
+    if [[ "$added" == true ]]; then
+        return 0
+    fi
+    return 1
+}
+
+remove_mkinitcpio_hook() {
+    # Remove a hook from HOOKS in all mkinitcpio config files.
+    # Usage: remove_mkinitcpio_hook <hook_name>
+
+    local hook="$1"
+
+    local configs=()
+    [[ -f /etc/mkinitcpio.conf ]] && configs+=(/etc/mkinitcpio.conf)
+    for f in /etc/mkinitcpio.conf.d/*.conf; do
+        [[ -f "$f" ]] && grep -qE '^\s*HOOKS=' "$f" && configs+=("$f")
+    done
+
+    for conf in "${configs[@]}"; do
+        if grep -qE "^\s*HOOKS=.*\b${hook}\b" "$conf"; then
+            sudo sed -i -E "s/ ${hook}\b//" "$conf"
+            info "  Removed ${hook} hook from $conf"
+        fi
+    done
+}
+
+show_effective_hooks() {
+    # Show the effective HOOKS line (last definition wins)
+    local last_hooks
+    last_hooks="$(grep -hE '^\s*HOOKS=' /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf 2>/dev/null | tail -1)"
+    info "  Effective HOOKS: $last_hooks"
+}
+
 detect_aur_helper() {
     for helper in yay paru pikaur; do
         if command -v "$helper" &>/dev/null; then
@@ -96,7 +161,7 @@ link_scripts() {
     info "Linking scripts to $BIN_DIR..."
     mkdir -p "$BIN_DIR"
 
-    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk x1fold-brightness x1fold-battery x1fold-oled-protect x1fold-battery-waybar x1fold-notification-focus; do
+    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk x1fold-brightness x1fold-battery x1fold-oled-protect x1fold-battery-waybar x1fold-notification-focus x1fold-palm-guard; do
         local src="$REPO_DIR/bin/$script"
         local dst="$BIN_DIR/$script"
 
@@ -251,6 +316,60 @@ EOF
     info "  Walker menus anchored to top (not full-screen center)"
 }
 
+setup_touchpad_quirks() {
+    info "Setting up libinput quirks for ThinkPad BT TrackPoint Keyboard..."
+
+    local quirks_dir="/etc/libinput"
+    local quirks_file="$quirks_dir/local-overrides.quirks"
+
+    sudo mkdir -p "$quirks_dir"
+
+    # Check if our section already exists
+    if [[ -f "$quirks_file" ]] && grep -q 'ThinkPad BT TrackPoint Keyboard II' "$quirks_file"; then
+        info "  Quirks already configured in $quirks_file"
+        return
+    fi
+
+    # Append our quirks (file may have other user quirks)
+    sudo tee -a "$quirks_file" >/dev/null <<'EOF'
+
+# ThinkPad Bluetooth TrackPoint Keyboard II (17ef:613e)
+#
+# The X1 Fold has no built-in keyboard — this BT keyboard is the primary
+# input device. Marking keyboard + touchpad as "internal" enables:
+#   1. DWT (disable-while-typing) — libinput only disables internal touchpads
+#      when typing on an internal keyboard
+#   2. Edge palm detection — libinput enables this automatically for internal
+#      touchpads (works without pressure/touch-size axes)
+#
+# The touchpad lacks pressure/touch-size axes, so pressure-based palm
+# detection is unavailable. Edge detection + DWT are the primary defenses.
+
+[ThinkPad BT TrackPoint Keyboard II (keyboard)]
+MatchUdevType=keyboard
+MatchBus=bluetooth
+MatchVendor=0x17EF
+MatchProduct=0x613E
+AttrKeyboardIntegration=internal
+
+[ThinkPad BT TrackPoint Keyboard II (touchpad)]
+MatchUdevType=touchpad
+MatchBus=bluetooth
+MatchVendor=0x17EF
+MatchProduct=0x613E
+AttrTouchpadIntegration=internal
+
+[ThinkPad BT TrackPoint Keyboard II (trackpoint)]
+MatchUdevType=pointingstick
+MatchBus=bluetooth
+MatchVendor=0x17EF
+MatchProduct=0x613E
+AttrPointingStickIntegration=external
+EOF
+    info "  Quirks written to $quirks_file"
+    info "  DWT + edge palm detection enabled for keyboard/touchpad pair"
+}
+
 setup_power_tuning() {
     info "Setting up power tuning for battery life..."
 
@@ -283,6 +402,20 @@ EOF
         echo auto | sudo tee "$dev" >/dev/null 2>&1 || true
     done
     info "  PCIe ASPM powersupersave enabled, PCI runtime PM set to auto"
+}
+
+uninstall_touchpad_quirks() {
+    local quirks_file="/etc/libinput/local-overrides.quirks"
+    if [[ -f "$quirks_file" ]] && grep -q 'ThinkPad BT TrackPoint Keyboard II' "$quirks_file"; then
+        # Remove our sections (from the comment header to the next blank line after each section)
+        sudo sed -i '/# ThinkPad Bluetooth TrackPoint Keyboard II/,/^$/d' "$quirks_file"
+        sudo sed -i '/\[ThinkPad BT TrackPoint Keyboard II/,/^$/d' "$quirks_file"
+        # Remove file if empty
+        if [[ ! -s "$quirks_file" ]]; then
+            sudo rm "$quirks_file"
+        fi
+        info "  Removed touchpad quirks"
+    fi
 }
 
 uninstall_power_tuning() {
@@ -334,16 +467,15 @@ setup_boot_bluetooth() {
     echo ""
 
     # Check that we're not using sd-encrypt (incompatible)
-    if [[ -f /etc/mkinitcpio.conf ]]; then
-        if grep -qE '^\s*HOOKS=.*\bsystemd\b' /etc/mkinitcpio.conf; then
-            error "Your mkinitcpio.conf uses the 'systemd' hook."
-            error "mkinitcpio-bluetooth is NOT compatible with the systemd hook."
-            error "You would need to switch from sd-encrypt to the traditional 'encrypt' hook."
-            error "Aborting."
-            exit 1
-        fi
-    else
+    if [[ ! -f /etc/mkinitcpio.conf ]]; then
         error "/etc/mkinitcpio.conf not found. Is mkinitcpio installed?"
+        exit 1
+    fi
+    if grep -rqE '^\s*HOOKS=.*\bsystemd\b' /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf 2>/dev/null; then
+        error "Your mkinitcpio config uses the 'systemd' hook."
+        error "mkinitcpio-bluetooth is NOT compatible with the systemd hook."
+        error "You would need to switch from sd-encrypt to the traditional 'encrypt' hook."
+        error "Aborting."
         exit 1
     fi
 
@@ -422,34 +554,18 @@ setup_boot_bluetooth() {
     fi
     echo ""
 
-    # Step 4: Add bluetooth hook to mkinitcpio.conf
-    info "Step 4: Add bluetooth hook to mkinitcpio.conf"
+    # Step 4: Add bluetooth hook to mkinitcpio config
+    info "Step 4: Add bluetooth hook to mkinitcpio config"
 
-    local mkinit_conf="/etc/mkinitcpio.conf"
-    if grep -qE '^\s*HOOKS=.*\bbluetooth\b' "$mkinit_conf"; then
-        info "  bluetooth hook already present"
-    else
-        # Insert 'bluetooth' after 'keyboard' in the HOOKS array
-        if grep -qE '^\s*HOOKS=.*\bkeyboard\b' "$mkinit_conf"; then
-            sudo sed -i -E 's/(HOOKS=.*\bkeyboard\b)/\1 bluetooth/' "$mkinit_conf"
-            info "  Added bluetooth hook after keyboard"
-        else
-            # If no keyboard hook found, add before encrypt/block
-            if grep -qE '^\s*HOOKS=.*\bblock\b' "$mkinit_conf"; then
-                sudo sed -i -E 's/(HOOKS=.*)\bblock\b/\1bluetooth block/' "$mkinit_conf"
-                info "  Added bluetooth hook before block"
-            else
-                error "Could not find a suitable place to insert the bluetooth hook."
-                error "Please add 'bluetooth' to HOOKS manually in $mkinit_conf"
-                error "It should go after 'keyboard' and before 'encrypt'."
-                exit 1
-            fi
+    if ! add_mkinitcpio_hook bluetooth keyboard; then
+        # All configs already have it, or we need a fallback
+        if ! grep -rqE '^\s*HOOKS=.*\bbluetooth\b' /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf 2>/dev/null; then
+            error "Could not find a suitable place to insert the bluetooth hook."
+            error "Please add 'bluetooth' to HOOKS manually after 'keyboard'."
+            exit 1
         fi
     fi
-
-    # Show the current HOOKS line
-    info "  Current HOOKS:"
-    info "  $(grep -E '^\s*HOOKS=' "$mkinit_conf")"
+    show_effective_hooks
     echo ""
 
     # Step 5: Enable bluetooth service
@@ -552,7 +668,6 @@ setup_hibernate() {
     echo ""
 
     local swapfile="/swapfile"
-    local mkinit_conf="/etc/mkinitcpio.conf"
     local limine_conf="/etc/default/limine"
     local sleep_conf_dir="/etc/systemd/sleep.conf.d"
     local sleep_conf="$sleep_conf_dir/x1fold.conf"
@@ -600,26 +715,16 @@ setup_hibernate() {
     info "  Resume offset: $resume_offset"
     echo ""
 
-    # Step 3: Add resume hook to mkinitcpio.conf
+    # Step 3: Add resume hook to mkinitcpio config
     info "  Configuring mkinitcpio resume hook..."
-    if grep -qE '^\s*HOOKS=.*\bresume\b' "$mkinit_conf"; then
-        info "  resume hook already present"
-    else
-        # Insert 'resume' after 'encrypt' and before 'filesystems'
-        if grep -qE '^\s*HOOKS=.*\bencrypt\b' "$mkinit_conf"; then
-            sudo sed -i -E 's/(HOOKS=.*\bencrypt\b)/\1 resume/' "$mkinit_conf"
-            info "  Added resume hook after encrypt"
-        elif grep -qE '^\s*HOOKS=.*\bfilesystems\b' "$mkinit_conf"; then
-            sudo sed -i -E 's/(HOOKS=.*)\bfilesystems\b/\1resume filesystems/' "$mkinit_conf"
-            info "  Added resume hook before filesystems"
-        else
+    if ! add_mkinitcpio_hook resume encrypt; then
+        if ! grep -rqE '^\s*HOOKS=.*\bresume\b' /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf 2>/dev/null; then
             error "Could not find a suitable place to insert the resume hook."
-            error "Please add 'resume' to HOOKS manually in $mkinit_conf"
+            error "Please add 'resume' to HOOKS manually after 'encrypt'."
             return 1
         fi
     fi
-    info "  Current HOOKS:"
-    info "  $(grep -E '^\s*HOOKS=' "$mkinit_conf")"
+    show_effective_hooks
     echo ""
 
     # Step 4: Add resume parameters to bootloader
@@ -691,7 +796,6 @@ uninstall_hibernate() {
     info "Removing suspend-then-hibernate configuration..."
 
     local swapfile="/swapfile"
-    local mkinit_conf="/etc/mkinitcpio.conf"
     local limine_conf="/etc/default/limine"
     local sleep_conf="/etc/systemd/sleep.conf.d/x1fold.conf"
     local logind_conf="/etc/systemd/logind.conf"
@@ -713,12 +817,9 @@ uninstall_hibernate() {
         info "  Removed swap file from /etc/fstab"
     fi
 
-    # Remove resume hook from mkinitcpio.conf
-    if grep -qE '^\s*HOOKS=.*\bresume\b' "$mkinit_conf"; then
-        sudo sed -i -E 's/ resume\b//' "$mkinit_conf"
-        info "  Removed resume hook from mkinitcpio.conf"
-        changed=true
-    fi
+    # Remove resume hook from all mkinitcpio configs
+    remove_mkinitcpio_hook resume
+    changed=true
 
     # Remove resume parameters from limine config
     if grep -q "resume=/dev/mapper/root" "$limine_conf"; then
@@ -771,6 +872,8 @@ do_install() {
     echo ""
     setup_battery_thresholds
     echo ""
+    setup_touchpad_quirks
+    echo ""
     install_kernel_patch
     echo ""
     configure_swayosd
@@ -795,6 +898,7 @@ do_install() {
     info "  - OLED burn-in protection (dim/off/lock timeouts)"
     info "  - Auto-brightness via ambient light sensor"
     info "  - Battery charge thresholds (80/90% for longevity)"
+    info "  - Touchpad palm guard (extended DWT + edge palm detection)"
     info "  - Magnetic keyboard dock detection (patched thinkpad_acpi)"
     info "  - Power tuning (ASPM powersupersave, NMI watchdog off, PCI autosuspend)"
     info "  - Suspend-then-hibernate (s2idle 30min → hibernate for zero battery drain)"
@@ -831,9 +935,13 @@ do_uninstall() {
 
     uninstall_kernel_patch
     uninstall_power_tuning
+    uninstall_touchpad_quirks
     uninstall_hibernate
 
-    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk x1fold-brightness x1fold-battery x1fold-oled-protect x1fold-battery-waybar x1fold-notification-focus; do
+    # Stop palm guard if running
+    x1fold-palm-guard stop 2>/dev/null || true
+
+    for script in x1fold-laptop-mode x1fold-rotate x1fold-osk x1fold-brightness x1fold-battery x1fold-oled-protect x1fold-battery-waybar x1fold-notification-focus x1fold-palm-guard; do
         local dst="$BIN_DIR/$script"
         if [[ -L "$dst" ]]; then
             rm "$dst"

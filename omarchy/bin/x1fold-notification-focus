@@ -3,45 +3,74 @@
 # Focus the window that sent a mako notification.
 # Called from mako config: on-touch=exec x1fold-notification-focus "$id"
 #
-# Strategy:
-# 1. Get app-name from notification (before any dismiss)
-# 2. Focus window by matching app-name to Hyprland window class
-# 3. Try makoctl invoke (for apps that register a default action)
-# 4. Dismiss the notification if no window was focused
+# Matching strategy (most specific first):
+# 1. Match notification summary words against window titles within the same app class
+# 2. Fall back to most recently focused window of the matching app class
+# 3. Try makoctl invoke for apps that register a default action
 
 nid="$1"
 [ -z "$nid" ] && exit 1
 
-# Get app name before we dismiss anything
-app_name=$(makoctl list 2>/dev/null | awk -v id="Notification ${nid}:" '
-  index($0, id) { found=1; next }
-  found && /App name:/ { sub(/^[[:space:]]*App name: /, ""); print; exit }
-')
+# Parse notification details before dismissing
+eval "$(makoctl list 2>/dev/null | awk -v id="Notification ${nid}:" '
+  index($0, id) { found=1; sub(".*" id " *", ""); summary=$0; next }
+  found && /App name:/ { sub(/^[[:space:]]*App name: /, ""); app=$0 }
+  found && /^$/ || (found && /^Notification /) {
+    printf "app_name=%s\nsummary=%s\n", app, summary
+    exit
+  }
+  END { if (found) printf "app_name=%s\nsummary=%s\n", app, summary }
+')"
 
-# Focus window by matching app-name to Hyprland window class
-focused=false
+# Dismiss notification first so it doesn't block focus change
+makoctl dismiss -n "$nid" >/dev/null 2>&1
+
+# Focus window: try title match first, then class match
 if [ -n "$app_name" ]; then
     match=$(hyprctl clients -j 2>/dev/null | python3 -c "
 import json, sys
+
 app = sys.argv[1].lower()
+summary = sys.argv[2].lower() if len(sys.argv) > 2 else ''
 clients = json.load(sys.stdin)
-for c in sorted(clients, key=lambda x: x.get('focusHistoryID', 999)):
+
+# Filter to windows matching the app class
+matches = []
+for c in clients:
     cls = c.get('class', '').lower()
     if app in cls or cls.split('.')[-1] in app or app in cls.split('.')[-1]:
-        print(c.get('address', ''))
-        break
-" "$app_name" 2>/dev/null)
+        matches.append(c)
+
+if not matches:
+    sys.exit(0)
+
+# If only one window matches the class, use it
+if len(matches) == 1:
+    print(matches[0]['address'])
+    sys.exit(0)
+
+# Try to match summary words against window titles
+if summary:
+    # Extract meaningful words (skip short ones)
+    words = [w for w in summary.split() if len(w) > 2]
+    best = None
+    best_score = 0
+    for c in matches:
+        title = c.get('title', '').lower()
+        score = sum(1 for w in words if w in title)
+        if score > best_score:
+            best_score = score
+            best = c
+    if best and best_score > 0:
+        print(best['address'])
+        sys.exit(0)
+
+# Fall back to most recently focused window of this class
+by_focus = sorted(matches, key=lambda x: x.get('focusHistoryID', 999))
+print(by_focus[0]['address'])
+" "$app_name" "$summary" 2>/dev/null)
 
     if [ -n "$match" ]; then
         hyprctl dispatch focuswindow "address:$match" >/dev/null 2>&1
-        focused=true
     fi
-fi
-
-# Also try makoctl invoke for apps with registered default actions
-makoctl invoke -n "$nid" >/dev/null 2>&1
-
-# Dismiss if no window was focused
-if [ "$focused" = false ]; then
-    makoctl dismiss -n "$nid" >/dev/null 2>&1
 fi

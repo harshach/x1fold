@@ -1,0 +1,32 @@
+# ThinkPad Bluetooth TrackPoint Keyboard II (17ef:613e)
+#
+# The X1 Fold has no built-in keyboard — this BT keyboard is the primary
+# input device. Marking keyboard + touchpad as "internal" enables:
+#   1. DWT (disable-while-typing) — libinput only disables internal touchpads
+#      when typing on an internal keyboard
+#   2. Edge palm detection — libinput enables this automatically for internal
+#      touchpads (works without pressure/touch-size axes)
+#
+# The touchpad lacks pressure/touch-size axes, so pressure-based palm
+# detection is unavailable. Edge detection + DWT are the primary defenses.
+
+[ThinkPad BT TrackPoint Keyboard II (keyboard)]
+MatchUdevType=keyboard
+MatchBus=bluetooth
+MatchVendor=0x17EF
+MatchProduct=0x613E
+AttrKeyboardIntegration=internal
+
+[ThinkPad BT TrackPoint Keyboard II (touchpad)]
+MatchUdevType=touchpad
+MatchBus=bluetooth
+MatchVendor=0x17EF
+MatchProduct=0x613E
+AttrTouchpadIntegration=internal
+
+[ThinkPad BT TrackPoint Keyboard II (trackpoint)]
+MatchUdevType=pointingstick
+MatchBus=bluetooth
+MatchVendor=0x17EF
+MatchProduct=0x613E
+AttrPointingStickIntegration=external

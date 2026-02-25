@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+
+# Extended disable-while-typing for the ThinkPad BT TrackPoint Keyboard II.
+#
+# libinput's built-in DWT has a short timeout (~0.5s) which lets accidental
+# palm touches register between keystrokes. This daemon monitors raw keyboard
+# events and disables the touchpad via Hyprland for a longer configurable
+# period after the last keystroke.
+#
+# Usage: x1fold-palm-guard [daemon|start|stop]
+#
+# Environment:
+#   X1FOLD_PALM_TIMEOUT  Seconds after last keystroke to re-enable touchpad
+#                         (default: 1.0)
+
+set -euo pipefail
+
+TIMEOUT="${X1FOLD_PALM_TIMEOUT:-1.0}"
+PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/x1fold-palm-guard.pid"
+
+die() { echo "x1fold-palm-guard: $*" >&2; exit 1; }
+
+# Find the BT keyboard's /dev/input/eventN device.
+# The keyboard exposes multiple event devices with the same name; select
+# the one with EV_KEY (bit 1) in its ev capability bitmask.
+find_keyboard_dev() {
+    for name_file in /sys/class/input/event*/device/name; do
+        [[ "$(cat "$name_file" 2>/dev/null)" == "ThinkPad Bluetooth TrackPoint Keyboard" ]] || continue
+        local dev_dir ev_hex
+        dev_dir="$(dirname "$name_file")"
+        ev_hex="$(cat "$dev_dir/capabilities/ev" 2>/dev/null)" || continue
+        # Check if EV_KEY (bit 1) is set
+        if (( 0x${ev_hex} & 0x2 )); then
+            echo "/dev/input/$(basename "$(dirname "$dev_dir")")"
+            return
+        fi
+    done
+}
+
+# Find the touchpad's Hyprland device name.
+find_touchpad() {
+    hyprctl devices -j 2>/dev/null \
+        | jq -r '.mice[] | select(.name | test("trackpoint.*touchpad")) | .name' 2>/dev/null \
+        | head -1
+}
+
+# Read raw input events and print a line on each key-down.
+# Uses only Python stdlib (struct module) — no extra packages needed.
+read_key_events() {
+    python3 -c "
+import struct, sys, os
+fmt = '@llHHi'
+sz = struct.calcsize(fmt)
+EV_KEY = 1
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    while True:
+        d = os.read(fd, sz)
+        if len(d) < sz:
+            break
+        _, _, t, _, v = struct.unpack(fmt, d)
+        if t == EV_KEY and v == 1:
+            sys.stdout.write('k\n')
+            sys.stdout.flush()
+finally:
+    os.close(fd)
+" "$1"
+}
+
+guard_loop() {
+    local touchpad kb_dev
+
+    touchpad="$(find_touchpad)"
+    [[ -n "$touchpad" ]] || { echo "Touchpad not found in Hyprland"; return 1; }
+
+    kb_dev="$(find_keyboard_dev)"
+    [[ -n "$kb_dev" ]] || { echo "BT keyboard not found"; return 1; }
+    [[ -r "$kb_dev" ]] || die "Cannot read $kb_dev (add user to input group)"
+
+    echo "Guarding: $kb_dev → $touchpad (timeout: ${TIMEOUT}s)"
+
+    # Re-enable touchpad when this function exits (disconnect, signal, etc.)
+    trap 'hyprctl keyword "device['"$touchpad"']:enabled" true >/dev/null 2>&1' RETURN
+
+    while true; do
+        # Block until a keypress arrives
+        read -r _ || break
+
+        # Typing started — disable touchpad
+        hyprctl keyword "device[$touchpad]:enabled" false >/dev/null 2>&1
+
+        # Stay disabled while keypresses keep arriving within TIMEOUT
+        while read -r -t "$TIMEOUT" _; do :; done
+
+        # Typing paused — re-enable touchpad
+        hyprctl keyword "device[$touchpad]:enabled" true >/dev/null 2>&1
+    done < <(read_key_events "$kb_dev")
+}
+
+palm_guard_daemon() {
+    echo $$ > "$PID_FILE"
+    trap 'rm -f "$PID_FILE"' EXIT
+
+    while true; do
+        guard_loop 2>&1 || true
+        # Keyboard disconnected or not found — wait and retry
+        sleep 2
+    done
+}
+
+palm_guard_stop() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid="$(cat "$PID_FILE")"
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid"
+            echo "Stopped (pid $pid)"
+        fi
+        rm -f "$PID_FILE"
+    else
+        echo "Not running"
+    fi
+}
+
+case "${1:-daemon}" in
+    daemon) palm_guard_daemon ;;
+    start)  guard_loop ;;
+    stop)   palm_guard_stop ;;
+    *)
+        echo "Usage: x1fold-palm-guard [daemon|start|stop]" >&2
+        exit 1
+        ;;
+esac
