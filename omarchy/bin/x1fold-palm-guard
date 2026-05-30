@@ -25,7 +25,14 @@ die() { echo "x1fold-palm-guard: $*" >&2; exit 1; }
 # the one with EV_KEY (bit 1) in its ev capability bitmask.
 find_keyboard_dev() {
     for name_file in /sys/class/input/event*/device/name; do
-        [[ "$(cat "$name_file" 2>/dev/null)" == "ThinkPad Bluetooth TrackPoint Keyboard" ]] || continue
+        # Match by substring: the device may enumerate as a bare
+        # "ThinkPad Bluetooth TrackPoint Keyboard" (BT mode) or with a
+        # vendor prefix and "- USB" suffix when connected via USB/dock
+        # (e.g. "Primax Electronics Ltd. ThinkPad Bluetooth TrackPoint
+        # Keyboard - USB"). Skip the companion Touchpad/Mouse devices.
+        local _nm; _nm="$(cat "$name_file" 2>/dev/null)"
+        [[ "$_nm" == *"ThinkPad Bluetooth TrackPoint Keyboard"* ]] || continue
+        [[ "${_nm,,}" == *touchpad* || "${_nm,,}" == *mouse* ]] && continue
         local dev_dir ev_hex
         dev_dir="$(dirname "$name_file")"
         ev_hex="$(cat "$dev_dir/capabilities/ev" 2>/dev/null)" || continue
